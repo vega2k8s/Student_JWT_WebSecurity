@@ -152,6 +152,44 @@ DispatcherServlet → Controller 메서드 실행
 
 **결론**: `[AUDIT] 401/403`이라는 로그 태그는 같지만, **예외가 발생하는 지점이 "필터 체인"이냐 "컨트롤러 계층"이냐에 따라 Advice와 SecurityConfig 중 정확히 한쪽만 호출**된다. 어느 한쪽에만 로그를 남기면 다른 경로로 들어온 401/403은 감사 추적에서 통째로 빠진다. 그래서 두 지점 모두에 `[AUDIT]` 로그를 심어야 한다.
 
+### 2-4. `formLoginFilterChain` 403 응답을 HTML 에러 페이지로
+
+2-3의 `auditedAccessDeniedHandler()`는 403을 JSON으로 응답한다. REST API(`securityFilterChain`)는 이게 맞지만, **브라우저로 접근하는 `formLoginFilterChain`에서는 사용자에게 JSON이 그대로 보이는 게 부자연스럽다.** 그래서 `formLoginFilterChain` 전용으로 `auditedHtmlAccessDeniedHandler()`를 따로 두어, 같은 `[AUDIT]` 로그를 남기되 응답은 HTML 에러 페이지로 분리했다.
+
+```java
+private AccessDeniedHandler auditedHtmlAccessDeniedHandler() {
+    return (request, response, accessDeniedException) -> {
+        log.warn("[AUDIT] 접근 거부(403) - {} {} from {} : {}",
+                request.getMethod(), request.getRequestURI(), clientIp(request),
+                accessDeniedException.getMessage());
+        response.sendError(HttpServletResponse.SC_FORBIDDEN, "접근 권한이 없습니다");
+    };
+}
+```
+
+**동작 원리**: JSON을 직접 작성하는 대신 `response.sendError(403, ...)`을 호출한다. 서블릿 컨테이너는 `sendError()`가 호출되면 그 요청을 `server.error.path`(기본값 `/error`)로 **포워드**하고, Spring Boot의 `BasicErrorController`가 이를 받아 `DefaultErrorViewResolver`로 상태 코드에 맞는 에러 뷰(`error/403`)를 찾는다. 이때 `templates/error/403.html`을 Thymeleaf 템플릿으로 두면(아래), 일반 페이지와 동일하게 **`layout:decorate`로 레이아웃(헤더·네비바·푸터)이 그대로 적용된 채** 렌더링된다. (처음에는 `static/error/403.html`로 만들었으나, 정적 리소스로는 Thymeleaf 레이아웃을 적용할 수 없어 `templates/error/403.html`로 옮겼다.)
+
+```html
+<!-- templates/error/403.html -->
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org"
+      xmlns:layout="http://www.ultraq.net.nz/thymeleaf/layout" layout:decorate="layout/default_layout">
+<meta charset="UTF-8">
+<th:block layout:fragment="content">
+    <div class="container mt-5 text-center">
+        <h1 class="display-4">403</h1>
+        <p class="lead">접근 권한이 없습니다.</p>
+        <p class="text-muted">이 페이지에 접근하려면 필요한 권한(역할)이 없습니다. 해당 요청은 감사 로그에 기록되었습니다.</p>
+        <a href="/" class="btn btn-primary mt-3">홈으로</a>
+    </div>
+</th:block>
+</html>
+```
+
+**API 체인은 왜 그대로 JSON인가**: `securityFilterChain`(`/api/**`)의 403은 여전히 `auditedAccessDeniedHandler()`(`writeError()`로 JSON 작성)를 그대로 쓴다. REST API 클라이언트는 HTML 에러 페이지를 파싱할 이유가 없고, JSON 구조(`statusCode`/`message`/`timestamp`)를 기대하기 때문이다. 같은 403이라도 **호출 주체(브라우저 vs API 클라이언트)에 따라 응답 형식을 분리**한 것이지, 로직이나 감사 로그 내용이 달라진 것은 아니다.
+
+> 401(인증 실패)은 `formLoginFilterChain`에서 이미 `/login`으로 리다이렉트되는 것으로 충분한 안내가 되므로, 403과 달리 별도의 `error/401.html`은 만들지 않았다.
+
 ---
 
 ## 3. 실습 — 감사 로그 확인
