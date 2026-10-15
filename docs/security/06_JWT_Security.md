@@ -241,7 +241,11 @@ if (rt.isRevoked()) {
 
 ### 4-6. API 요청 한눈에 보기
 
-Refresh 토큰 적용 후 실제 인증 흐름에서 호출하는 API 요청을 정리하면 다음과 같다. (Base URL: `http://localhost:8080`)
+Refresh 토큰 적용 후 실제 인증 흐름에서 호출하는 API 요청을 정리하면 다음과 같다. 아래 `①-1`~`⑤` 각 코드블록은 `$B`를 포함해 필요한 변수를 모두 그 블록 안에서 직접 선언하므로, 블록 단위로 그대로 복붙 실행할 수 있다.
+
+```bash
+B=http://localhost:8080   # (Base URL)
+```
 
 **① 로그인 — `POST /api/userinfos/login`**
 ```
@@ -255,6 +259,36 @@ Content-Type: application/json
 ```
 → 응답: `accessToken`, `refreshToken`, `tokenType`("Bearer"), `expiresIn`(초), `email`, `name`, `roles`
 
+**①-1. 만료된 access 토큰으로 요청하기**
+
+access 는 900초(15분) 후 만료된다. 만료된 토큰으로 보호된 API를 호출하면 거부되고, 이때 refresh 토큰으로 갱신하면 다시 정상 호출할 수 있다.
+
+```bash
+LOGIN=$(curl -s "$B/api/userinfos/login" -H "Content-Type: application/json" -d '{"email":"admin@aa.com","password":"pwd1"}')
+UUID=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['accessToken'])" | cut -d. -f2 | python -c "import sys,base64,json;s=sys.stdin.read().strip();s+='='*(-len(s)%4);print(json.loads(base64.urlsafe_b64decode(s))['sub'])")
+REFRESH=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['refreshToken'])")
+
+# 만료된 access 토큰은 jwt_forge.py 의 forge() 함수를 ttl(음수)로 직접 호출해 재현했다
+# — 실제로는 900초(15분) 경과를 기다리는 것과 동일한 상태다
+EXPIRED_ACCESS=$(python -c "
+import sys
+sys.path.insert(0, 'docs/security')
+import jwt_forge
+print(jwt_forge.forge('$UUID', ttl=-30))
+")
+
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/me" -H "Authorization: Bearer $EXPIRED_ACCESS"
+
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$REFRESH\"}"
+```
+
+**검증 결과** (test 프로파일, 검증됨):
+
+| 요청 | 결과 |
+|---|---|
+| 만료된 access 토큰으로 `/me` | **401**  ( 유효한 토큰이 없습니다 ) |
+| 유효한 refresh 토큰으로 `/refresh` | **200**  새 access 발급 |
+
 **② 토큰 갱신 — `POST /api/userinfos/refresh`**
 ```
 POST http://localhost:8080/api/userinfos/refresh
@@ -266,6 +300,20 @@ Content-Type: application/json
 ```
 → 응답: 새 `accessToken` + 새 `refreshToken`(1회용 **회전**, 값이 바뀜)
 
+**②-1. 유효하지 않은 Refresh Token으로 토큰 갱신(refresh) 요청하기**
+
+발급된 적 없는 임의의 문자열을 refresh 토큰으로 보내면, DB(`refresh_token` 테이블)에서 해시가 일치하는 레코드를 찾지 못해 거부된다.
+
+```bash
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d '{"refreshToken":"garbage-not-issued-0000"}'
+```
+
+**검증 결과** (test 프로파일, 검증됨):
+
+| 요청 | 결과 |
+|---|---|
+| 발급된 적 없는 refresh 토큰으로 `/refresh` | **401**  "유효하지 않은 refresh 토큰입니다" |
+
 **③ 로그아웃 — `POST /api/userinfos/logout`**
 ```
 POST http://localhost:8080/api/userinfos/logout
@@ -276,6 +324,56 @@ Content-Type: application/json
 }
 ```
 → 응답: **204 No Content** (서버가 해당 refresh 를 DB 에서 삭제)
+
+**④ 1단계 방식 위조 토큰으로 재시도 — `GET /api/userinfos/me`**
+
+secret 이 유출된 상태를 가정하고, 1단계와 동일한 방식(`sub`에 email 을 넣어 서명)으로 위조한 토큰을 이 2단계 서버에 제시한다. 비교를 위해, **같은 secret·같은 서명 방식**으로 실제 사용자의 **uuid** 를 `sub`에 넣어 위조한 토큰도 함께 시도한다.
+
+```bash
+LOGIN=$(curl -s "$B/api/userinfos/login" -H "Content-Type: application/json" -d '{"email":"admin@aa.com","password":"pwd1"}')
+UUID=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['accessToken'])" | cut -d. -f2 | python -c "import sys,base64,json;s=sys.stdin.read().strip();s+='='*(-len(s)%4);print(json.loads(base64.urlsafe_b64decode(s))['sub'])")
+
+FT_UUID=$(python docs/security/jwt_forge.py "$UUID")          # sub = 실제 uuid (secret 은 동일)
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/me" -H "Authorization: Bearer $FT_UUID"
+
+FT_EMAIL=$(python docs/security/jwt_forge.py admin@aa.com)    # sub = email (1단계와 동일한 방식)
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/me" -H "Authorization: Bearer $FT_EMAIL"
+```
+
+**검증 결과** (test 프로파일, 검증됨):
+
+| 위조 방식 | 결과 |
+|---|---|
+| `sub`=실제 uuid (같은 secret) | **200**  서명·uuid 모두 일치 → 인증됨 |
+| `sub`=email, 1단계 방식 (같은 secret) | **401**  서명은 유효하지만 그런 uuid 를 가진 사용자가 없음 |
+
+→ 두 토큰 모두 같은 secret 으로 유효하게 서명됐다. 차이는 오직 `sub`에 담긴 값뿐이다 — **uuid 전환이 "서명 위조 자체"가 아니라 "위조해서 흉내 낼 수 있는 대상(공격 범위)"을 차단한다**는 것을 보여준다.
+
+**⑤ Refresh 토큰 재사용 탐지 — `POST /api/userinfos/refresh`**
+
+회전으로 이미 폐기된(한 번 쓰인) refresh 토큰을 다시 제출하면 재사용으로 간주돼 거부되고, 그 사용자의 **모든** refresh 토큰이 함께 폐기된다 — 회전으로 막 받은, 아직 쓰지 않은 최신 토큰도 예외가 아니다.
+
+```bash
+LOGIN=$(curl -s "$B/api/userinfos/login" -H "Content-Type: application/json" -d '{"email":"admin@aa.com","password":"pwd1"}')
+R1=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['refreshToken'])")   # 최초 refresh
+
+# R1을 한 번 /refresh 에 써서 회전시키면 R2(새 토큰)가 나온다. 응답에서 R2를 꺼내 둔다.
+ROT1=$(curl -s "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$R1\"}")   # 200
+R2=$(echo "$ROT1" | python -c "import sys,json;print(json.load(sys.stdin)['refreshToken'])")
+
+# R1(이미 폐기됨)을 다시 제출 → 재사용 탐지
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$R1\"}"
+
+# 방금 받은 R2(아직 한 번도 안 쓴 최신 토큰)도 함께 폐기됐는지 확인
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$R2\"}"
+```
+
+**검증 결과** (test 프로파일, 검증됨):
+
+| 요청 | 결과 |
+|---|---|
+| 이미 회전으로 폐기된 R1 재사용 | **401**  "재사용이 감지되어 모든 세션이 종료되었습니다. 다시 로그인하세요" |
+| 재사용 탐지 직후, 아직 쓰지 않은 R2 로 `/refresh` | **401**  "유효하지 않은 refresh 토큰입니다" — 전체 폐기가 실제로 적용됨 |
 
 **참고) 인증이 필요한 일반 API 호출 — `GET /api/userinfos/me`**
 ```
@@ -309,6 +407,17 @@ Authorization: Bearer <accessToken>
 
 **Q2. access 와 refresh 토큰의 차이는?**
 **access** 는 API 호출마다 `Authorization` 헤더로 보내는 **단기 JWT**(권한 증표)다. 자주 노출되므로 **짧게** 둔다. **refresh** 는 access 가 만료됐을 때 **새 access 를 받기 위한 장기 자격**으로, 평소엔 보관만 하고 `/refresh` 호출 때만 쓴다. 이 앱의 refresh 는 **JWT 가 아니라 서버 DB 에 저장한 무작위 값**이라 **폐기(로그아웃)·회전**이 가능하다. 요약: **access=짧고 자주, refresh=길고 가끔·서버가 통제**.
+
+**Q3. 토큰이 없거나 유효하지 않아 401 이 발생했는데 `[AUDIT]` 로그가 안 남는 경우가 있었다. 원인은?**
+감사 로그 출처가 두 군데로 나뉘어 있었기 때문이다.
+- **로그인 성공/실패**(아이디·비밀번호 불일치 등)는 `SecurityAuditListener`가 Spring Security 의 `AuthenticationSuccessEvent`/`AbstractAuthenticationFailureEvent`를 구독해 `[AUDIT]`로 남긴다.
+- **토큰이 없거나 유효하지 않아** API 호출 자체가 거부되는 401 은 `SecurityConfig`의 `authenticationEntryPoint()`에서 응답이 만들어진다. 이 처리는 Security 필터 체인(`ExceptionTranslationFilter`) 안에서 끝나며 `DispatcherServlet`/컨트롤러까지 요청이 도달하지 않는다. 그런데 기존 `[AUDIT]` 로그는 `DefaultExceptionAdvice`의 `@ExceptionHandler(AuthenticationException.class)`(컨트롤러 실행 중 발생한 예외만 받는 `@RestControllerAdvice`)에만 있었으므로, 이 경로에서는 호출될 수 없어 로그가 비어 있었다.
+
+수정: `authenticationEntryPoint()` 내부에서 응답을 쓰기 직전에 직접 `[AUDIT]` 로그를 남기도록 변경했다(`SecurityConfig.java`). 요청 메서드·URI·클라이언트 IP·실패 사유를 함께 기록한다.
+
+```
+[AUDIT] 인증 실패(401) - GET /api/students from 0:0:0:0:0:0:0:1 : Full authentication is required to access this resource
+```
 
 ---
 
