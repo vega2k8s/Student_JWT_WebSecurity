@@ -263,31 +263,23 @@ Content-Type: application/json
 
 access 는 900초(15분) 후 만료된다. 만료된 토큰으로 보호된 API를 호출하면 거부되고, 이때 refresh 토큰으로 갱신하면 다시 정상 호출할 수 있다.
 
-```bash
-LOGIN=$(curl -s "$B/api/userinfos/login" -H "Content-Type: application/json" -d '{"email":"admin@aa.com","password":"pwd1"}')
-UUID=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['accessToken'])" | cut -d. -f2 | python -c "import sys,base64,json;s=sys.stdin.read().strip();s+='='*(-len(s)%4);print(json.loads(base64.urlsafe_b64decode(s))['sub'])")
-REFRESH=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['refreshToken'])")
+**Postman 으로 테스트해보기**
 
-# 만료된 access 토큰은 jwt_forge.py 의 forge() 함수를 ttl(음수)로 직접 호출해 재현했다
-# — 실제로는 900초(15분) 경과를 기다리는 것과 동일한 상태다
-EXPIRED_ACCESS=$(python -c "
-import sys
-sys.path.insert(0, 'docs/security')
-import jwt_forge
-print(jwt_forge.forge('$UUID', ttl=-30))
-")
-
-curl -s -w "\n%{http_code}\n" "$B/api/userinfos/me" -H "Authorization: Bearer $EXPIRED_ACCESS"
-
-curl -s -w "\n%{http_code}\n" "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$REFRESH\"}"
 ```
+GET http://localhost:8080/api/userinfos/me
+Authorization: Bearer <만료된 accessToken>
+```
+→ 응답: 401 "인증이 필요합니다 ( 유효한 토큰이 없습니다 )"
 
-**검증 결과** (test 프로파일, 검증됨):
+```
+POST http://localhost:8080/api/userinfos/refresh
+Content-Type: application/json
 
-| 요청 | 결과 |
-|---|---|
-| 만료된 access 토큰으로 `/me` | **401**  ( 유효한 토큰이 없습니다 ) |
-| 유효한 refresh 토큰으로 `/refresh` | **200**  새 access 발급 |
+{
+  "refreshToken": "<로그인 응답으로 받은 refreshToken>"
+}
+```
+→ 응답: 새 `accessToken` + 새 `refreshToken`(1회용 회전, 값이 바뀜)
 
 **② 토큰 갱신 — `POST /api/userinfos/refresh`**
 ```
@@ -324,6 +316,46 @@ Content-Type: application/json
 }
 ```
 → 응답: **204 No Content** (서버가 해당 refresh 를 DB 에서 삭제)
+
+**curl 스크립트로 테스트하기**
+
+```bash
+B=http://localhost:8080
+
+# 로그인하여 accessToken/refreshToken 을 함께 받는다
+LOGIN=$(curl -s "$B/api/userinfos/login" -H "Content-Type: application/json" -d '{"email":"admin@aa.com","password":"pwd1"}')
+# access 토큰의 payload(두 번째 파트)를 base64 디코딩해 sub(uuid) 값을 추출한다
+UUID=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['accessToken'])" | cut -d. -f2 | python -c "import sys,base64,json;s=sys.stdin.read().strip();s+='='*(-len(s)%4);print(json.loads(base64.urlsafe_b64decode(s))['sub'])")
+# 로그인 응답에서 refreshToken 을 추출한다
+REFRESH=$(echo "$LOGIN" | python -c "import sys,json;print(json.load(sys.stdin)['refreshToken'])")
+
+# 만료된 access 토큰은 jwt_forge.py 의 forge() 함수를 ttl(음수)로 직접 호출해 재현했다
+# — 실제로는 900초(15분) 경과를 기다리는 것과 동일한 상태다
+EXPIRED_ACCESS=$(python -c "
+import sys
+sys.path.insert(0, 'docs/security')
+import jwt_forge
+print(jwt_forge.forge('$UUID', ttl=-30))
+")
+
+# 만료된 access 토큰으로 보호된 API 를 호출 → 401 예상
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/me" -H "Authorization: Bearer $EXPIRED_ACCESS"
+
+# 유효한 refresh 토큰으로 갱신 요청 → 200, 새 access 발급 예상(응답을 저장해 새 refreshToken 을 꺼내 쓴다)
+ROTATED=$(curl -s "$B/api/userinfos/refresh" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$REFRESH\"}")
+echo "$ROTATED"
+
+# 방금 회전으로 받은 새 refresh 토큰을 꺼내 로그아웃 테스트
+NEW_REFRESH=$(echo "$ROTATED" | python -c "import sys,json;print(json.load(sys.stdin)['refreshToken'])")
+curl -s -w "\n%{http_code}\n" "$B/api/userinfos/logout" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$NEW_REFRESH\"}"
+```
+
+**검증 결과** (test 프로파일, 검증됨):
+
+| 요청 | 결과 |
+|---|---|
+| 만료된 access 토큰으로 `/me` | **401**  ( 유효한 토큰이 없습니다 ) |
+| 유효한 refresh 토큰으로 `/refresh` | **200**  새 access 발급 |
 
 **④ 1단계 방식 위조 토큰으로 재시도 — `GET /api/userinfos/me`**
 
