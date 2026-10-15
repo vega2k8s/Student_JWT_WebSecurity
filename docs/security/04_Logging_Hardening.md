@@ -81,6 +81,77 @@ protected ResponseEntity<ErrorObject> handleException(AccessDeniedException e, H
 ```
 > 403(접근 거부)은 **권한 상승 시도의 신호**일 수 있어 "누가·무엇을" 함께 남긴다.
 
+### 2-3. `SecurityConfig` 자체의 401/403 처리 — Advice만으로 충분하지 않은 이유
+
+2-2의 `DefaultExceptionAdvice`(`@RestControllerAdvice`)는 401/403을 이미 `[AUDIT]`로 남기고 있다. 그런데도 이후 브랜치들에서는 `SecurityConfig`의 `securityFilterChain`·`formLoginFilterChain` 양쪽에 **또** `[AUDIT]` 로그를 추가했다. 중복이 아니라, **Advice가 아예 호출되지 않는 경로**가 따로 있기 때문이다.
+
+**핵심 원리**: Spring Security의 필터 체인은 `DispatcherServlet`(= Controller, `@RestControllerAdvice`가 동작하는 계층) **이전** 단계에서 실행된다. `.authorizeHttpRequests(...)` 규칙 위반이나 인증 필터의 실패는 필터 체인 안의 `ExceptionTranslationFilter`가 즉시 가로채 그 체인에 설정된 `AuthenticationEntryPoint`(401)·`AccessDeniedHandler`(403)로 응답을 직접 써버린다. 요청이 `DispatcherServlet`까지 도달하지 못하므로, 컨트롤러 메서드 실행 중에만 동작하는 `@RestControllerAdvice`는 이 예외를 **아예 보지 못한다**. 즉 "로그가 Advice에 있으니 됐다"가 아니라, **예외가 발생하는 지점(필터 체인 vs. 컨트롤러 계층)에 따라 둘 중 하나만 호출되므로, 두 지점 모두에 로그를 심어야 누락이 없다.**
+
+**① `securityFilterChain`(API, `/api/**`) — 왜 필요한가**
+
+- 401: `JwtAuthenticationFilter`가 토큰이 없거나 무효하다고 판단하는 순간 발생. 이 필터 자체가 `DispatcherServlet` 이전 단계이므로 Advice는 호출될 수 없다.
+- 403: `.requestMatchers("/api/**").authenticated()` 같은 URL 규칙을 `AuthorizationFilter`가 평가해 거부하는 순간 발생. 역시 필터 체인 단계라 Advice에 도달하지 않는다.
+  (단, 컨트롤러 메서드에 `@PreAuthorize`로 거는 메서드 보안은 메서드 호출 시점에 평가되므로 `DispatcherServlet`을 통과한 뒤이고, 이 경우의 403은 Advice의 `AccessDeniedException` 핸들러가 정상적으로 캐치한다. 즉 같은 403이라도 **어디서 막혔는지**에 따라 Advice가 보는 것과 못 보는 것이 갈린다.)
+
+```java
+.exceptionHandling(ex -> ex
+        .authenticationEntryPoint(authenticationEntryPoint())      // 401 → [AUDIT] 로그 + JSON 응답
+        .accessDeniedHandler(auditedAccessDeniedHandler()))        // 403 → [AUDIT] 로그 + JSON 응답
+```
+
+**② `formLoginFilterChain`(세션/폼 로그인, catch-all) — 왜 필요한가**
+
+- 이 체인은 원래 `exceptionHandling` 자체가 없었다. `/users/**`·`/actuator/**`에 대한 401/403이 Spring Security의 **기본 처리**로 빠지며 `[AUDIT]` 로그가 전혀 남지 않았다. (`securityFilterChain`은 로그가 "Advice에만" 있었던 것과 달리, 이쪽은 **아무 데도** 없었다.)
+- 401: 세션 기반이라 실제 응답은 JSON 401이 아니라 `/login`으로의 302 리다이렉트다. 그래도 원인은 "인증 안 된 상태로 보호된 경로에 접근"으로 API 체인의 401과 동일하므로, 같은 `[AUDIT]` 태그로 남기되 응답 자체는 기존 `LoginUrlAuthenticationEntryPoint`에 위임해 리다이렉트 동작은 그대로 유지한다.
+- 403: `/actuator/**`를 `ROLE_ADMIN`으로 제한한 규칙을 세션 인증된 사용자가 위반할 때 발생. API 체인과 **동일한** `auditedAccessDeniedHandler()`를 공유해서 쓴다 — 403의 의미(권한 부족)와 응답 형식(JSON)이 같기 때문이다.
+
+```java
+.exceptionHandling(ex -> ex
+        .authenticationEntryPoint(auditedLoginEntryPoint())        // 401 → [AUDIT] 로그 + /login 리다이렉트(기존 동작 유지)
+        .accessDeniedHandler(auditedAccessDeniedHandler()))        // 403 → [AUDIT] 로그 + JSON 응답(API 체인과 공유)
+```
+
+**전체 오류 처리 흐름**
+
+```
+클라이언트 요청
+   │
+   ▼
+securityMatcher 로 체인 선택 ( "/api/**" → securityFilterChain(@Order 1) ,
+                              그 외 전부 → formLoginFilterChain(@Order 2) )
+   │
+   ▼
+[ 필터 체인 내부 ]
+  인증 필터 (JwtAuthenticationFilter / 세션+폼 로그인) 통과?
+       │ 실패(토큰 없음·무효, 또는 미인증 상태로 보호 경로 접근)
+       └──▶ ExceptionTranslationFilter 가 AuthenticationException 포착
+                 └──▶ 그 체인에 설정된 AuthenticationEntryPoint 호출
+                        → [AUDIT] 인증 실패(401) 로그
+                        → 응답 직접 작성 (API: JSON 401 / 폼: /login 리다이렉트)
+                        ⚠ DispatcherServlet·Controller·Advice 는 전혀 호출되지 않는다
+       │ 통과
+       ▼
+  인가 필터 (AuthorizationFilter, .authorizeHttpRequests 규칙) 통과?
+       │ 거부(인증은 됐지만 권한 부족)
+       └──▶ ExceptionTranslationFilter 가 AccessDeniedException 포착
+                 └──▶ 그 체인에 설정된 AccessDeniedHandler 호출
+                        → [AUDIT] 접근 거부(403) 로그
+                        → 응답 직접 작성 (JSON 403)
+                        ⚠ 이 경우도 DispatcherServlet·Advice 는 호출되지 않는다
+       │ 통과
+       ▼
+DispatcherServlet → Controller 메서드 실행
+       │
+       ├─ 메서드 보안(@PreAuthorize 등) 평가 실패 → AccessDeniedException 발생
+       │        └──▶ Spring MVC 예외 처리 → @RestControllerAdvice(DefaultExceptionAdvice) 가 캐치
+       │                 → [AUDIT] 접근 거부(403) 로그 (2-2 참고) + ResponseEntity 작성
+       │
+       └─ 로그인 처리 중 자격 증명 불일치 등 → AuthenticationException 발생
+                └──▶ 동일하게 DefaultExceptionAdvice 가 캐치 → [AUDIT] 인증 실패(401) 로그
+```
+
+**결론**: `[AUDIT] 401/403`이라는 로그 태그는 같지만, **예외가 발생하는 지점이 "필터 체인"이냐 "컨트롤러 계층"이냐에 따라 Advice와 SecurityConfig 중 정확히 한쪽만 호출**된다. 어느 한쪽에만 로그를 남기면 다른 경로로 들어온 401/403은 감사 추적에서 통째로 빠진다. 그래서 두 지점 모두에 `[AUDIT]` 로그를 심어야 한다.
+
 ---
 
 ## 3. 실습 — 감사 로그 확인
