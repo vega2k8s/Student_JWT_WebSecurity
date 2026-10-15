@@ -266,6 +266,20 @@ private String name;
 
 ### 4-4. 심층 방어 — CSP(Content-Security-Policy) 헤더 (적용됨 — 2026-10-13)
 
+> **CSP(Content-Security-Policy)란?** 브라우저가 페이지에 포함된 리소스(스크립트·스타일·이미지·폰트 등)를 "어느 출처에서 가져온 것까지 신뢰하고 실행·로드할지"를 서버가 HTTP 응답 헤더(`Content-Security-Policy`)로 선언하고, 브라우저가 그 규칙을 강제하는 보안 메커니즘이다. 서버 코드가 이스케이프를 깜빡해 악성 스크립트가 HTML에 섞여 들어가더라도, 그 스크립트가 정책이 허용하지 않는 형태(인라인, 또는 허용 안 된 외부 출처)라면 브라우저가 실행 자체를 거부한다.
+>
+> **왜 등장했나**: 전통적인 XSS 방어(출력 이스케이프)는 애플리케이션의 모든 출력 지점이 항상 올바르게 구현돼 있다는 전제에 의존한다. 하지만 실제 서비스는 코드량이 많고 서드파티 라이브러리·레거시 페이지·사람의 실수가 섞이기 마련이라, "한 곳이라도 이스케이프를 빠뜨리면 뚫린다"는 구조적 약점이 있다. 이를 보완하기 위해 W3C가 CSP를 표준화했고(2012년 Level 1, 이후 Level 2/3로 발전), "애플리케이션 코드가 실수해도 브라우저가 한 번 더 막아준다"는 **선언적·브라우저 강제형 심층 방어**를 가능하게 했다.
+>
+> **주요 지시문 분류**:
+>
+> | 분류 | 지시문 예 | 역할 |
+> |---|---|---|
+> | 리소스 로딩(fetch directives) | `script-src`, `style-src`, `img-src`, `font-src`, `connect-src`, `media-src`, `frame-src`, `worker-src`, `object-src` 등 | 리소스 종류별로 "어느 출처에서 가져온 것만 허용할지" 지정 |
+> | 기본값 | `default-src` | 위 fetch directives 중 개별 지정 안 된 것들이 물려받는 공통 기본값(단 `base-uri`/`frame-ancestors`/`form-action` 등은 물려받지 않는 예외) |
+> | 문서 속성 | `base-uri` | `<base>` 태그로 바꿀 수 있는 상대경로 기준 출처 제한 |
+> | 네비게이션 | `frame-ancestors`, `form-action` | 이 페이지를 iframe으로 감쌀 수 있는 출처 / 폼 제출(action) 허용 대상 제한 |
+> | 허용 값(source) | `'self'`, `'none'`, `'unsafe-inline'`, `'unsafe-eval'`, 특정 호스트(`https://cdn...`), `'nonce-...'`, `'sha256-...'` | 각 지시문에 넣을 수 있는 값. `'unsafe-inline'`을 켜지 않고도 신뢰하는 특정 인라인 스크립트만 허용하려면 nonce/hash 방식을 쓴다 |
+
 출력 이스케이프가 1차 방어라면, **CSP는 "혹시 뚫렸을 때"의 2차 방어선**이다. `script-src 'self'` 같은 정책을 헤더로 내려보내면, 인라인 `<script>`나 외부(신뢰하지 않은 출처) 스크립트 로드를 브라우저 차원에서 차단해 XSS의 피해를 줄일 수 있다.
 
 **적용 위치**: `SecurityConfig.java` — Thymeleaf 화면을 담당하는 `formLoginFilterChain`(`@Order(2)`)에만 적용했다(`/api/**` JSON 체인은 브라우저 렌더링이 없어 CSP가 의미가 없다).
@@ -286,16 +300,44 @@ private String name;
 | 지시어 | 값 | 이유 |
 |---|---|---|
 | `default-src` | `'self'` | 명시하지 않은 나머지 리소스 유형의 기본값을 같은 출처로 제한 |
-| `script-src` | `'self' https://cdn.jsdelivr.net` | 같은 출처 + Bootstrap JS(CDN)만 허용. `'unsafe-inline'` 없음 — **이것이 핵심**: `index-vuln.html`에 `<script>`가 주입돼도 `'self'`가 아니므로 브라우저가 실행을 거부한다 |
+| `script-src` | `'self' https://cdn.jsdelivr.net` | 같은 출처 + Bootstrap JS(CDN)만 허용. `'unsafe-inline'` 없음 — **이것이 핵심**: 인라인 `<script>`는 출처(origin) 일치 여부와 무관하게, `'unsafe-inline'`이 없으면 애초에 실행 허용 대상이 아니므로 기본 차단된다 |
 | `style-src` | `'self' https://cdn.jsdelivr.net` | Bootstrap CSS(CDN) 허용. 인라인 `style="..."` 속성은 모두 제거했으므로 `'unsafe-inline'` 불필요 |
 | `img-src` | `'self'` | 이 앱은 외부/인라인 이미지를 쓰지 않음 |
 | `object-src` | `'none'` | `<object>`/`<embed>` 완전 차단 |
-| `base-uri` | `'self'` | `<base>` 태그로 상대경로를 가로채는 공격 차단 |
+| `base-uri` | `'self'` | `<base>` 태그로 상대경로를 가로채는 공격(base tag injection) 차단 |
 | `frame-ancestors` | `'self'` | 클릭재킹 방지(다른 출처가 이 앱을 `<iframe>`으로 감싸지 못함) |
 
-**선행 작업 — inline 제거**: CSP를 `'unsafe-inline'` 없이 걸려면 템플릿에 inline 이벤트 핸들러/스타일이 없어야 한다. 기존 `index.html`/`index-vuln.html`의 삭제 폼에 있던 `onsubmit="return confirm(...)"`와 `style="display:inline"`을 제거하고:
-- `onsubmit` → `static/js/confirm-delete.js`(외부 스크립트, `footer.html`에서 전역 로드)로 이동, 폼에 `class="js-confirm-delete"` 부여
-- `style="display:inline"` → Bootstrap 유틸리티 클래스 `d-inline`으로 대체
+**`<script>alert(document.domain)</script>`는 막히는가?** 그렇다 — `index-vuln.html`(th:utext)에 이 문자열이 저장되어 응답 HTML에 이스케이프 없이 그대로 포함되더라도(= "주입" 자체는 성공), 브라우저가 그 인라인 `<script>`를 실행하려는 시점에 `script-src`에 `'unsafe-inline'`이 없으므로 실행이 거부된다. 즉 **서버 코드의 결함(이스케이프 누락)은 그대로 남아 있지만, 그 결함이 실제 피해(스크립트 실행)로 이어지는 것을 CSP가 막는다** — 이것이 "출력 이스케이프가 근본 대책, CSP는 그것이 뚫렸을 때의 2차 방어선"이라는 말의 구체적 의미다. 단, 허용된 출처(self/jsdelivr) 안에서 벌어지는 DOM 기반 XSS나 `'unsafe-inline'`을 실수로 추가하는 경우에는 이 방어선도 무력해진다.
+
+**선행 작업 — inline 제거**: CSP를 `'unsafe-inline'` 없이 걸려면 템플릿에 inline 이벤트 핸들러/스타일이 없어야 한다. `onsubmit="..."` 같은 HTML 이벤트 속성도 `<script src=...>`로 불러온 외부 JS가 아니라 **"인라인 스크립트"로 취급**되므로, `script-src`에 `'unsafe-inline'`이 없으면 CSP가 그 핸들러 자체의 실행을 막아버린다(콘솔에 `Refused to execute inline event handler...` 에러가 뜨며 삭제 확인창이 아예 뜨지 않는다). 그래서 CSP를 걸기 **전에** 기존 `index.html`/`index-vuln.html`의 삭제 폼에 있던 `onsubmit="return confirm(...)"`와 `style="display:inline"`을 먼저 제거해야 했다.
+
+**Before (inline, CSP 적용 시 깨짐)**
+```html
+<form th:action="@{/users/delete/{id}(id=${user.id})}" method="post"
+      style="display:inline" onsubmit="return confirm('Are you sure you want to delete this user?')">
+```
+
+**After (외부 스크립트로 분리, CSP와 호환)**
+```html
+<form th:action="@{/users/delete/{id}(id=${user.id})}" method="post" class="d-inline js-confirm-delete">
+```
+- `onsubmit` → **제거**하고 `class="js-confirm-delete"` 마커만 부여. 실제 confirm 로직은 아래 `confirm-delete.js`로 옮긴다.
+- `style="display:inline"` → Bootstrap 유틸리티 클래스 `d-inline`으로 대체(인라인 스타일도 `style-src`에 `'unsafe-inline'`이 없으면 같은 이유로 차단되기 때문).
+
+**`static/js/confirm-delete.js`의 역할** — onsubmit에 있던 confirm 로직을 그대로 옮겨놓은, **외부 출처(`'self'`)에서 로드되는** 스크립트 파일이다. `script-src 'self'`가 허용하는 것은 "외부 `.js` 파일로 로드된 스크립트"이지 "인라인 코드"가 아니므로, 똑같은 동작을 인라인이 아닌 형태로 재구현한 것이 이 파일의 존재 이유다.
+```javascript
+// confirm-delete.js
+document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('form.js-confirm-delete').forEach(function (form) {
+        form.addEventListener('submit', function (e) {
+            if (!confirm('Are you sure you want to delete this user?')) {
+                e.preventDefault();
+            }
+        });
+    });
+});
+```
+페이지가 로드되면(`DOMContentLoaded`) `js-confirm-delete` 클래스가 붙은 모든 삭제 폼을 찾아 `submit` 이벤트에 리스너를 건다 — 사용자가 "취소"를 누르면 `preventDefault()`로 폼 제출 자체를 막는다. `onsubmit="return confirm(...)"`가 하던 일과 **기능적으로 동일**하지만, 이벤트 핸들러가 HTML 속성이 아니라 외부 `.js` 파일 안에 있으므로 CSP의 "인라인 금지" 규칙에 걸리지 않는다. 이 파일은 `footer.html`에서 `<script th:src="@{/js/confirm-delete.js}"></script>`로 모든 페이지에 전역 로드된다.
 
 **검증(실측, 2026-10-13)**: 서버 기동 후 `curl -sI http://localhost:8080/users/index`로 `Content-Security-Policy` 응답 헤더가 내려오는지 확인하고, 브라우저 개발자 도구 콘솔에서 `index-vuln.html`에 저장된 `<script>` payload가 **"Refused to execute inline script..."** 로 차단되는지 확인한다(§3-2의 Stored XSS가 **CSP 때문에 실제 실행은 되지 않음** — 응답 HTML에는 여전히 이스케이프 없이 포함되므로 "주입 자체"는 재현되지만, "실행"은 CSP가 막는다는 점이 이 심층 방어의 핵심 교육 포인트다).
 
