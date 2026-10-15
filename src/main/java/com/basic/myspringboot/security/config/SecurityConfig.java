@@ -118,16 +118,16 @@ public class SecurityConfig {
                 //    CSP 가 있으면 주입된 <script> 가 응답 HTML에 그려져도 'self' 가 아니라서 브라우저가 실행을 차단한다
                 //    (= 애플리케이션 코드의 결함과는 별개로 동작하는 심층 방어 계층)
                 //  - inline onsubmit/style 은 모두 제거하고 외부 js/css 로 옮겼으므로 'unsafe-inline' 이 필요 없다
-                .headers(headers -> headers
-                        .contentSecurityPolicy(csp -> csp
-                                .policyDirectives(
-                                        "default-src 'self'; "
-                                                + "script-src 'self' https://cdn.jsdelivr.net; "
-                                                + "style-src 'self' https://cdn.jsdelivr.net; "
-                                                + "img-src 'self'; "
-                                                + "object-src 'none'; "
-                                                + "base-uri 'self'; "
-                                                + "frame-ancestors 'self'")))
+//                .headers(headers -> headers
+//                        .contentSecurityPolicy(csp -> csp
+//                                .policyDirectives(
+//                                        "default-src 'self'; "
+//                                                + "script-src 'self' https://cdn.jsdelivr.net; "
+//                                                + "style-src 'self' https://cdn.jsdelivr.net; "
+//                                                + "img-src 'self'; "
+//                                                + "object-src 'none'; "
+//                                                + "base-uri 'self'; "
+//                                                + "frame-ancestors 'self'")))
                 .build();
     }
 
