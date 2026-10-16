@@ -190,6 +190,28 @@ private AccessDeniedHandler auditedHtmlAccessDeniedHandler() {
 
 > 401(인증 실패)은 `formLoginFilterChain`에서 이미 `/login`으로 리다이렉트되는 것으로 충분한 안내가 되므로, 403과 달리 별도의 `error/401.html`은 만들지 않았다.
 
+### 2-5. "보호된 페이지 접근(미인증)"과 "로그인 폼 제출 실패"는 서로 다른 지점에서 기록된다
+
+2-3의 `auditedLoginEntryPoint()`는 `AuthenticationEntryPoint` 구현체로, `ExceptionTranslationFilter`가 `AuthenticationException`을 가로챘을 때만 호출된다. 이 예외는 **"세션(인증) 없이 보호된 경로에 접근했을 때"** 발생하는 것이고, **로그인 폼(`/login-process`) 제출 자체의 성공/실패**는 전혀 다른 경로를 탄다 — 둘 다 "401과 관련된 상황"이지만 기록되는 지점이 다르다.
+
+| 상황 | 요청 예 | 실제 처리 지점 | 남는 감사 로그 |
+|---|---|---|---|
+| 세션 없이 보호된 경로 접근 | `GET /users/index` (세션 없음) | `ExceptionTranslationFilter` → `AuthenticationEntryPoint.commence()` = `auditedLoginEntryPoint()` | `[AUDIT] 인증 실패(401) - GET /users/index ...` (`SecurityConfig`) |
+| 로그인 폼에 틀린 비밀번호 제출 | `POST /login-process` | `UsernamePasswordAuthenticationFilter.unsuccessfulAuthentication()` → `AuthenticationFailureHandler` 호출 + `AbstractAuthenticationFailureEvent` 발행 | `[AUDIT] 로그인 실패 - user=..., reason=BadCredentialsException` (`SecurityAuditListener`, 2-1) |
+
+실제 로그로 확인한 예:
+```
+# 세션 없이 /users/index 접근 (GET)
+[AUDIT] 인증 실패(401) - GET /users/index from 0:0:0:0:0:0:0:1 : Full authentication is required to access this resource
+
+# 로그인 폼에 틀린 비밀번호 제출 (POST /login-process)
+[AUDIT] 로그인 실패 - user=cs***@aa.com, reason=BadCredentialsException
+```
+
+**왜 두 로그로 나뉘는가**: `AuthenticationEntryPoint`는 "이미 진행 중인 요청을 보호된 자원에 대해 거부"하는 지점이다. 반면 로그인 폼 제출은 그 요청 자체가 "인증을 시도"하는 것이라, `UsernamePasswordAuthenticationFilter`가 자신의 필터 안에서 성공/실패를 바로 처리하고 끝낸다 — `ExceptionTranslationFilter`까지 갈 필요 없이 필터 내부의 `AuthenticationFailureHandler`로 바로 빠진다. 그래서 로그인 폼 실패는 `auditedLoginEntryPoint()`가 아니라, 2-1에서 본 `SecurityAuditListener`의 `AbstractAuthenticationFailureEvent` 리스너가 담당한다.
+
+> 참고: `feature/bruteforce-demo`는 이 `AbstractAuthenticationFailureEvent`/`AuthenticationSuccessEvent` 리스너가 폼 로그인·REST 로그인 모두를 관통하는 공통 지점이라는 점을 그대로 활용해, `LoginAttemptService.onFailure()`/`onSuccess()`도 같은 자리에서 호출하도록 연결했다(로그인 시도 제한을 두 경로 모두에 동일하게 적용).
+
 ---
 
 ## 3. 실습 — 감사 로그 확인
