@@ -9,10 +9,12 @@ import com.basic.myspringboot.exception.ErrorCode;
 import com.basic.myspringboot.repository.DepartmentRepository;
 import com.basic.myspringboot.repository.StudentDetailRepository;
 import com.basic.myspringboot.repository.StudentRepository;
+import com.basic.myspringboot.security.AccessControl;
 import com.basic.myspringboot.security.models.UserInfo;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -43,18 +45,36 @@ public class StudentService {
                 .toList();
     }
 
-    public StudentDTO.Response getStudentById(Long id) {
+    public StudentDTO.Response getStudentById(Long id, UserInfo currentUser) {
         Student student = studentRepository.findByIdWithAllDetails(id)
                 .orElseThrow(() -> new BusinessException(ErrorCode.RESOURCE_NOT_FOUND,
                         "Student", "id", id));
+        // 접근 제어(IDOR 방지) : 관리자가 아니라면 본인 정보만 조회할 수 있다.
+        if (!currentUser.isAdmin() && !AccessControl.isOwner(student, currentUser)) {
+            throw new AccessDeniedException("본인 정보만 조회할 수 있습니다");
+        }
         return StudentDTO.Response.fromEntity(student);
     }
 
-    public StudentDTO.Response getStudentByStudentNumber(String studentNumber) {
+    public StudentDTO.Response getStudentByStudentNumber(String studentNumber, UserInfo currentUser) {
         Student student = studentRepository.findByStudentNumber(studentNumber)
                 .orElseThrow(() -> new BusinessException(ErrorCode.RESOURCE_NOT_FOUND,
                         "Student", "student number", studentNumber));
+        if (!currentUser.isAdmin() && !AccessControl.isOwner(student, currentUser)) {
+            throw new AccessDeniedException("본인 정보만 조회할 수 있습니다");
+        }
         return StudentDTO.Response.fromEntity(student);
+    }
+
+    // 로그인한 사용자 본인이 등록한 학생이 있는지 조회한다( 없으면 404 ).
+    // 소유권 검사가 필요 없다 — 조회 조건 자체가 "내가 등록한 학생" 이다.
+    public StudentDTO.Response getMyStudent(UserInfo currentUser) {
+        List<Student> myStudents = studentRepository.findByUserInfo(currentUser);
+        if (myStudents.isEmpty()) {
+            throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND,
+                    "Student", "user", currentUser.getEmail());
+        }
+        return StudentDTO.Response.fromEntity(myStudents.get(0));
     }
 
     // 페이징 처리된 특정 학과의 학생 조회
@@ -139,11 +159,17 @@ public class StudentService {
     }
 
     @Transactional
-    public StudentDTO.Response updateStudent(Long id, StudentDTO.Request request) {
+    public StudentDTO.Response updateStudent(Long id, StudentDTO.Request request, UserInfo currentUser) {
         // Find the student
         Student student = studentRepository.findById(id)
                 .orElseThrow(() -> new BusinessException(ErrorCode.RESOURCE_NOT_FOUND,
                         "Student", "id", id));
+
+        // 접근 제어(IDOR 방지) : 관리자가 아니라면 본인이 등록한 학생만 수정할 수 있다.
+        // {id} 값만 바꿔 남의 학생 정보를 수정하는 것을 막는다.
+        if (!currentUser.isAdmin() && !AccessControl.isOwner(student, currentUser)) {
+            throw new AccessDeniedException("본인이 등록한 학생 정보만 수정할 수 있습니다");
+        }
 
         // Validate department exists (if changing)
         Department department = departmentRepository.findById(request.getDepartmentId())
